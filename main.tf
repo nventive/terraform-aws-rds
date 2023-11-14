@@ -1,5 +1,23 @@
 locals {
-  enabled = module.this.enabled
+  enabled       = module.this.enabled
+  proxy_enabled = module.this.enabled && var.proxy_enabled
+
+  ssm_get_arn      = join("", aws_ssm_parameter.db_password.*.arn)
+  password_decoded = base64decode(var.database_password)
+
+  username_password = {
+    username = var.database_user
+    password = local.password_decoded
+  }
+
+  auth = [{
+    auth_scheme = "SECRETS"
+    description = "Access the database instance using username and password from AWS Secrets Manager"
+    iam_auth    = "DISABLED"
+    secret_arn  = join("", aws_secretsmanager_secret.rds_username_and_password.*.arn)
+  }]
+
+  proxy_engine_family = var.engine == "mysql" ? "MYSQL" : (var.engine == "postgres" ? "POSTGRESQL" : null)
 }
 
 module "db" {
@@ -89,11 +107,6 @@ resource "aws_ssm_parameter" "db_password" {
   tags = module.this.tags
 }
 
-locals {
-  ssm_get_arn      = join("", aws_ssm_parameter.db_password.*.arn)
-  password_decoded = base64decode(var.database_password)
-}
-
 data "aws_iam_policy_document" "ssm" {
   statement {
     sid       = "AllowReadSsmParameterDbPassword"
@@ -116,4 +129,61 @@ resource "aws_iam_policy" "ssm_get" {
   policy = data.aws_iam_policy_document.ssm.json
 
   tags = module.this.tags
+}
+
+module "proxy_label" {
+  source  = "cloudposse/label/null"
+  version = "0.25.0" # requires Terraform >= 0.13.0
+
+  enabled    = local.proxy_enabled
+  attributes = compact(concat(module.this.attributes, ["proxy"]))
+  context    = module.this.context
+}
+
+resource "aws_secretsmanager_secret" "rds_username_and_password" {
+  count = local.proxy_enabled ? 1 : 0
+
+  name                    = module.proxy_label.id
+  description             = "RDS username and password"
+  recovery_window_in_days = 0
+  tags                    = module.proxy_label.tags
+}
+
+resource "aws_secretsmanager_secret_version" "rds_username_and_password" {
+  count = local.proxy_enabled ? 1 : 0
+
+  secret_id     = join("", aws_secretsmanager_secret.rds_username_and_password.*.id)
+  secret_string = jsonencode(local.username_password)
+}
+
+module "rds_proxy" {
+  source  = "cloudposse/rds-db-proxy/aws"
+  version = "1.1.0"
+
+  db_instance_identifier = module.db.instance_id
+  auth                   = local.auth
+  vpc_security_group_ids = concat([module.sg.id], var.security_group_ids)
+  vpc_subnet_ids         = var.subnet_ids
+
+  debug_logging                = var.proxy_debug_logging
+  engine_family                = local.proxy_engine_family
+  idle_client_timeout          = var.proxy_idle_client_timeout
+  require_tls                  = var.proxy_require_tls
+  connection_borrow_timeout    = var.proxy_connection_borrow_timeout
+  init_query                   = var.proxy_init_query
+  max_connections_percent      = var.proxy_max_connections_percent
+  max_idle_connections_percent = var.proxy_max_idle_connections_percent
+  session_pinning_filters      = var.proxy_session_pinning_filters
+  existing_iam_role_arn        = var.proxy_existing_iam_role_arn
+
+  context = module.proxy_label.context
+}
+
+resource "null_resource" "password_validation" {
+  lifecycle {
+    precondition {
+      condition     = !(local.proxy_enabled && var.database_password == "")
+      error_message = "The `database_password` is required when `proxy_enabled` is `true`."
+    }
+  }
 }
